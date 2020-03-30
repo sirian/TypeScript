@@ -18462,6 +18462,8 @@ namespace ts {
                 let typeVariableCount = 0;
                 if (targetFlags & TypeFlags.Union) {
                     let nakedTypeVariable: Type | undefined;
+                    let remainderArePromises = false;
+                    const sources = source.flags & TypeFlags.Union ? (<UnionType>source).types : [source];
                     for (const t of targets) {
                         if (getInferenceInfoForType(t)) {
                             nakedTypeVariable = t;
@@ -18470,11 +18472,13 @@ namespace ts {
                     }
 
                     // To better handle inference for `Promise`-like types, we detect a target union of `T | PromiseLike<T>`
-                    // (for any compatible `PromiseLike`). When encountered, we infer from source to the type parameter `T`,
-                    // where each type of source is mapped to extract the promised type of any promise (e.g.,
-                    // `string | Promise<number>` becomes `string | number`).
+                    // (for any compatible `PromiseLike`). When encountered, we infer all promise-like sources to the promise-like
+                    // targets and all non-promise-like sources to the naked type variable. For example when inferring to
+                    // `T | PromiseLike<T>` from `number | boolean | Promise<string>`, we infer to `PromiseLike<T>` from
+                    // `Promise<string>` and to `T` for `number | boolean`. We allow for multiple promise-like types in target
+                    // to better support JQuery's `PromiseBase` which returns something like
+                    // `PromiseBase<T, U, V...> | PromiseLike<T> | T` in its fulfillment callbacks.
                     if (typeVariableCount === 1) {
-                        let remainderArePromises = false;
                         for (const t of targets) {
                             if (!getInferenceInfoForType(t)) {
                                 if (isPromiseForType(t, nakedTypeVariable!)) {
@@ -18486,14 +18490,8 @@ namespace ts {
                                 }
                             }
                         }
-                        // remaining constituents are promise-like types whose "promised types" are `T`
-                        if (remainderArePromises) {
-                            inferFromTypes(mapType(source, s => getPromisedTypeOfPromise(s) ?? s), nakedTypeVariable!);
-                            return;
-                        }
                     }
 
-                    const sources = source.flags & TypeFlags.Union ? (<UnionType>source).types : [source];
                     const matched = new Array<boolean>(sources.length);
                     let inferenceCircularity = false;
                     // First infer to types that are not naked type variables. For each source type we
@@ -18503,12 +18501,28 @@ namespace ts {
                     for (const t of targets) {
                         if (!getInferenceInfoForType(t)) {
                             for (let i = 0; i < sources.length; i++) {
-                                const saveInferencePriority = inferencePriority;
-                                inferencePriority = InferencePriority.MaxValue;
-                                inferFromTypes(sources[i], t);
-                                if (inferencePriority === priority) matched[i] = true;
-                                inferenceCircularity = inferenceCircularity || inferencePriority === InferencePriority.Circularity;
-                                inferencePriority = Math.min(inferencePriority, saveInferencePriority);
+                                // When inferring to a union consisting solely `T` and promise-like constituents,
+                                // we infer only promise-like sources to promise-like constituents.
+                                let promisedType: Type | undefined;
+                                if (!remainderArePromises || (promisedType = getPromisedTypeOfPromise(sources[i]))) {
+                                    const saveInferencePriority = inferencePriority;
+                                    inferencePriority = InferencePriority.MaxValue;
+                                    // When inferring to a union of `T | PromiseLike<T>`, we will first
+                                    // infer a promise-like source to a promise-like target, but we will
+                                    // also infer the promised type directly to the type variable.
+                                    inferFromTypes(sources[i], t);
+                                    if (inferencePriority === priority) {
+                                        if (promisedType) {
+                                            sources[i] = promisedType;
+                                            matched[i] = false;
+                                        }
+                                        else {
+                                            matched[i] = true;
+                                        }
+                                    }
+                                    inferenceCircularity = inferenceCircularity || inferencePriority === InferencePriority.Circularity;
+                                    inferencePriority = Math.min(inferencePriority, saveInferencePriority);
+                                }
                             }
                         }
                     }
@@ -18527,7 +18541,7 @@ namespace ts {
                     // types from which no inferences have been made so far and infer from that union to the
                     // naked type variable.
                     if (typeVariableCount === 1 && !inferenceCircularity) {
-                        const unmatched = flatMap(sources, (s, i) => matched[i] ? undefined : s);
+                        const unmatched = mapDefined(sources, (s, i) => matched[i] ? undefined : s);
                         if (unmatched.length) {
                             inferFromTypes(getUnionType(unmatched), nakedTypeVariable!);
                             return;
